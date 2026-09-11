@@ -14,6 +14,7 @@ from minisgl.message import (
     UserMsg,
 )
 from minisgl.utils import init_logger, load_tokenizer
+from minisgl.trace import trace
 
 from .cache import CacheManager
 from .config import SchedulerConfig
@@ -150,13 +151,8 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
-                print(
-                f"[TRACE] TOKEN "
-                f"uid={req.uid} "
-                f"phase={batch.phase} "
-                f"token={next_token} "
-                f"device_len={req.device_len}"
-                )
+                trace("SCHED.TOKEN", step=batch.trace_step, uid=req.uid,
+                      token=next_token, device_len=req.device_len)
                 finished = not req.can_decode
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
@@ -180,10 +176,7 @@ class Scheduler(SchedulerIOMixin):
         elif isinstance(msg, ExitMsg):
             raise KeyboardInterrupt
         elif isinstance(msg, UserMsg):
-            print(
-        f"[TRACE] REQUEST_RECEIVED "
-        f"uid={msg.uid} "
-        f"input_tokens={len(msg.input_ids)}")
+            trace("SCHED.REQUEST_RECEIVED", uid=msg.uid, input_tokens=len(msg.input_ids))
             logger.debug_rank0("Received user msg: %s", msg)
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
@@ -234,30 +227,26 @@ class Scheduler(SchedulerIOMixin):
             or self.decode_manager.schedule_next_batch()
         )
         if batch is not None:
-            print(
-                f"[TRACE] BATCH_SCHEDULED "
-                f"phase={batch.phase} "
-                f"bs={batch.size} "
-                f"uids={[r.uid for r in batch.reqs]} "
-                f"cached={[r.cached_len for r in batch.reqs]} "
-                f"device={[r.device_len for r in batch.reqs]}"
+            self._trace_step = getattr(self, "_trace_step", 0) + 1
+            batch.trace_step = self._trace_step   # the id travels with the batch
+            trace(
+                "SCHED.BATCH_SCHEDULED",
+                step=batch.trace_step,
+                phase=batch.phase,
+                bs=batch.size,
+                uids=[r.uid for r in batch.reqs],
+                cached=[r.cached_len for r in batch.reqs],
+                device=[r.device_len for r in batch.reqs],
             )
         return self._prepare_batch(batch) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
-        print(
-        f"[TRACE] FORWARD_BEGIN "
-        f"phase={batch.phase} "
-        f"bs={batch.size} "
-        f"extend={[r.extend_len for r in batch.reqs]}"
-        )
+        trace("SCHED.FORWARD_BEGIN", step=batch.trace_step, phase=batch.phase,
+        bs=batch.size, extend=[r.extend_len for r in batch.reqs])
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
-        print(
-        f"[TRACE] FORWARD_END "
-        f"phase={batch.phase}"
-        )
+        trace("SCHED.FORWARD_END", step=batch.trace_step)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
